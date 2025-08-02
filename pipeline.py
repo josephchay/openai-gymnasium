@@ -500,9 +500,10 @@ class Agent:
         
         total_loss = state_loss + reward_loss + done_loss
         
-        # Backward pass
+        # Backward pass with gradient clipping
         self.env_model_optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.env_model.parameters(), max_norm=1.0)
         self.env_model_optimizer.step()
         
         return total_loss.item()
@@ -610,6 +611,7 @@ class Agent:
         
         self.critic_optimizer.zero_grad()
         total_critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
         
         # Train actor on dreamed data (less frequently)
@@ -622,6 +624,7 @@ class Agent:
             
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
             actor_loss = actor_loss.item()
         
@@ -666,6 +669,7 @@ class Agent:
         
         self.critic_optimizer.zero_grad()
         total_critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.critic_optimizer.step()
         
         # Train actor
@@ -678,6 +682,7 @@ class Agent:
             
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
             
             # Update target networks
