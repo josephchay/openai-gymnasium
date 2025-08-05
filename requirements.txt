@@ -1,0 +1,5 @@
+torch==2.4.0
+numpy==1.26.4
+gymnasium==1.0.0
+box2d-py==2.3.5
+matplotlib==3.9.2
