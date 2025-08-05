@@ -1,0 +1,670 @@
+import gymnasium as gym
+import numpy as np
+import torch
+import argparse
+import os
+import time
+import json
+import signal
+import sys
+import pickle
+from datetime import datetime
+from pathlib import Path
+from pipeline import Agent, ExplorationStrategy
+
+class GracefulStopper:
+    """Handle graceful stopping via Ctrl+C"""
+    def __init__(self):
+        self.stop_training = False
+        signal.signal(signal.SIGINT, self._signal_handler)
+    
+    def _signal_handler(self, sig, frame):
+        print('\n🛑 Graceful stop requested. Finishing current episode...')
+        self.stop_training = True
+
+def create_run_directory(base_models_dir, env_name, resume_run=None):
+    """
+    Create or find run directory with structure: /models/{env}/
+    
+    Args:
+        base_models_dir: Base models directory (e.g., './models')
+        env_name: Environment name
+        resume_run: Specific run name to resume from or 'latest'
+    
+    Returns:
+        run_dir: Path to run directory
+        is_resume: Boolean indicating if this is a resume
+    """
+    env_dir = Path(base_models_dir) / env_name
+    env_dir.mkdir(parents=True, exist_ok=True)
+    
+    if resume_run:
+        # Resume from specific run or latest
+        if resume_run == "latest":
+            # Find latest run based on modification time
+            run_dirs = [d for d in env_dir.iterdir() if d.is_dir() and d.name.startswith('run_')]
+            if not run_dirs:
+                raise ValueError(f"No existing runs found for {env_name}")
+            # Sort by modification time and get the latest
+            run_dirs.sort(key=lambda x: x.stat().st_mtime)
+            run_dir = run_dirs[-1]
+            print(f"📂 Resuming from latest run: {run_dir}")
+        else:
+            # Resume from specific run name
+            run_dir = env_dir / resume_run
+            if not run_dir.exists():
+                available_runs = [d.name for d in env_dir.iterdir() if d.is_dir() and d.name.startswith('run_')]
+                raise ValueError(f"Run '{resume_run}' not found. Available runs: {available_runs}")
+            print(f"📂 Resuming from specified run: {run_dir}")
+        return run_dir, True
+    else:
+        # Create new run
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = env_dir / f"run_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"📂 Starting new run: {run_dir}")
+        return run_dir, False
+
+def save_training_state(run_dir, agent, episode_rewards, episode, best_avg_reward, best_episode):
+    """Save complete training state for resuming"""
+    
+    # Save model checkpoints
+    checkpoint_path = run_dir / f"checkpoint_ep{episode}.pth"
+    agent.save(str(checkpoint_path))
+    
+    # Save latest model
+    latest_path = run_dir / "latest.pth"
+    agent.save(str(latest_path))
+    
+    # Save episode rewards
+    rewards_path = run_dir / "episode_rewards.json"
+    with open(rewards_path, 'w') as f:
+        json.dump(episode_rewards, f)
+    
+    # Save training metadata
+    metadata = {
+        'current_episode': episode,
+        'total_episodes': len(episode_rewards),
+        'best_avg_reward': best_avg_reward,
+        'best_episode': best_episode,
+        'last_update': datetime.now().isoformat(),
+        'env_name': agent.env_name
+    }
+    
+    metadata_path = run_dir / "training_metadata.json"
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    # Save replay buffer
+    buffer_path = run_dir / "replay_buffer.pkl"
+    buffer_data = {
+        'buffer': agent.replay_buffer,
+        'current_episode': episode,
+        'episode_rewards': episode_rewards,
+        'best_avg_reward': best_avg_reward,
+        'best_episode': best_episode
+    }
+    
+    with open(buffer_path, 'wb') as f:
+        pickle.dump(buffer_data, f)
+    
+    print(f"💾 Training state saved at episode {episode}")
+
+def load_training_state(run_dir, agent):
+    """Load training state for resuming"""
+    
+    # Load latest model
+    latest_path = run_dir / "latest.pth"
+    if latest_path.exists():
+        print("🔄 Loading latest model...")
+        agent.load(str(latest_path))
+    else:
+        raise FileNotFoundError(f"No latest model found in {run_dir}")
+    
+    # Load episode rewards
+    rewards_path = run_dir / "episode_rewards.json"
+    if rewards_path.exists():
+        with open(rewards_path, 'r') as f:
+            episode_rewards = json.load(f)
+        print(f"📊 Loaded {len(episode_rewards)} episode rewards")
+    else:
+        episode_rewards = []
+    
+    # Load training metadata
+    metadata_path = run_dir / "training_metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        start_episode = metadata['current_episode'] + 1
+        best_avg_reward = metadata.get('best_avg_reward', -float('inf'))
+        best_episode = metadata.get('best_episode', 0)
+        print(f"📈 Resume from episode {start_episode}, best avg reward: {best_avg_reward:.2f}")
+    else:
+        start_episode = len(episode_rewards)
+        best_avg_reward = -float('inf')
+        best_episode = 0
+    
+    # Load replay buffer
+    buffer_path = run_dir / "replay_buffer.pkl"
+    if buffer_path.exists():
+        print("🧠 Loading replay buffer...")
+        with open(buffer_path, 'rb') as f:
+            buffer_data = pickle.load(f)
+        agent.replay_buffer = buffer_data['buffer']
+        print(f"✅ Loaded replay buffer with {len(agent.replay_buffer)} experiences")
+    
+    return episode_rewards, start_episode, best_avg_reward, best_episode
+
+def train(env_name='LunarLanderContinuous-v3', max_episodes=None, 
+                                            models_dir='./models', enable_exploration=True, 
+                                            resume_run=None, log_frequency=1):
+    # Create run directory structure: models/{env}/run_timestamp/
+    run_dir, is_resume = create_run_directory(models_dir, env_name, resume_run)
+    
+    # Initialize graceful stopper
+    stopper = GracefulStopper()
+    
+    # Environment setup
+    env = gym.make(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    
+    print(f"🌍 Environment: {env_name}")
+    print(f"📏 State dimension: {state_dim}")
+    print(f"🎯 Action dimension: {action_dim}")
+    print(f"⚡ Max action: {max_action}")
+    print(f"📝 Logging frequency: Every {log_frequency} episode(s)")
+    print(f"📁 Run directory: {run_dir}")
+    
+    if max_episodes:
+        print(f"🔄 Training will run for {max_episodes} episodes")
+    else:
+        print("🔄 Training will run INDEFINITELY until manually stopped (Ctrl+C)")
+    
+    # Agent setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🔧 Using device: {device}")
+    
+    agent = Agent(state_dim, action_dim, max_action, env_name, device)
+    exploration_strategy = ExplorationStrategy(env_name, agent, env)
+    
+    # Load or initialize training state
+    if is_resume:
+        try:
+            episode_rewards, start_episode, best_avg_reward, best_episode = load_training_state(run_dir, agent)
+            print(f"✅ Successfully resumed training from episode {start_episode}")
+        except Exception as e:
+            print(f"❌ Error loading training state: {e}")
+            print("🔄 Starting fresh training...")
+            episode_rewards, start_episode, best_avg_reward, best_episode = [], 0, -float('inf'), 0
+    else:
+        episode_rewards, start_episode, best_avg_reward, best_episode = [], 0, -float('inf'), 0
+    
+    # Get environment-specific parameters
+    exploration_episodes = agent.config['exploration_episodes'] if enable_exploration else 0
+    dream_frequency = agent.config['dream_frequency']
+    pretrain_steps = agent.config['env_model_pretrain_steps']
+    
+    print(f"🔍 Exploration episodes: {exploration_episodes}")
+    print(f"💭 Dream frequency: every {dream_frequency} episodes")
+    print(f"🧠 Environment model pretrain steps: {pretrain_steps}")
+    
+    # Training metrics
+    start_time = time.time()
+    
+    # Phase 1: Exploration Phase (only if not resuming from post-exploration)
+    if enable_exploration and start_episode < exploration_episodes:
+        print("=== EXPLORATION PHASE ===")
+        
+        for episode in range(start_episode, exploration_episodes):
+            if stopper.stop_training:
+                print("🛑 Training stopped during exploration phase.")
+                break
+                
+            state, _ = env.reset()
+            episode_reward = 0
+            done = False
+            steps = 0
+            
+            while not done:
+                # Get exploration action
+                action = exploration_strategy.get_exploration_action(state, episode, exploration_episodes)
+                
+                # Environment step
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                # Store experience (no training yet)
+                agent.replay_buffer.add(state, action, reward, next_state, done)
+                
+                state = next_state
+                episode_reward += reward
+                steps += 1
+            
+            episode_rewards.append(episode_reward)
+            
+            # Per-episode exploration logging
+            if (episode + 1) % 20 == 0:
+                avg_reward = np.mean(episode_rewards[-20:])
+                print(f"Exploration Episode {episode + 1}/{exploration_episodes}, "
+                      f"Avg Reward: {avg_reward:.2f}, Buffer: {len(agent.replay_buffer)}")
+            
+            # Save state every 50 episodes during exploration
+            if (episode + 1) % 50 == 0:
+                save_training_state(run_dir, agent, episode_rewards, episode, best_avg_reward, best_episode)
+        
+        if not stopper.stop_training:
+            print(f"✅ Exploration completed. Buffer size: {len(agent.replay_buffer)}")
+            
+            # Pre-train environment model on exploration data
+            print("🧠 Pre-training environment model on exploration data...")
+            pretrain_losses = []
+            for i in range(pretrain_steps):
+                if stopper.stop_training:
+                    print("🛑 Training stopped during environment model pre-training.")
+                    break
+                    
+                loss = agent.train_env_model(batch_size=128)
+                if loss > 0:
+                    pretrain_losses.append(loss)
+                if (i + 1) % 100 == 0:
+                    avg_loss = np.mean(pretrain_losses[-100:]) if pretrain_losses else 0
+                    print(f"Pre-train step {i + 1}/{pretrain_steps}, Avg Loss: {avg_loss:.4f}")
+            
+            if not stopper.stop_training:
+                print("✅ Environment model pre-training completed!")
+                agent.exploration_phase = False
+            
+            start_episode = exploration_episodes
+    
+    # Phase 2: Training Phase
+    if not stopper.stop_training:
+        print("=== TRAINING PHASE ===")
+        print("Episode format: Ep XXXX | R: reward | Avg: avg_reward | Buf: buffer_size | Noise: noise_scale | Steps: episode_steps")
+        print("Press Ctrl+C to stop training gracefully and save the model.")
+        
+        episode = start_episode
+        while not stopper.stop_training and (max_episodes is None or episode < max_episodes):
+            state, _ = env.reset()
+            episode_reward = 0
+            done = False
+            steps = 0
+            
+            # Track losses during episode
+            episode_losses = {'critic': [], 'actor': [], 'env_model': []}
+            
+            # Update noise scale based on progress
+            total_episodes = max_episodes if max_episodes else episode + 10000
+            agent.update_noise_scale(episode, total_episodes, exploration_episodes)
+            
+            while not done and not stopper.stop_training:
+                # Select action with adaptive noise
+                action = agent.select_action(state, add_noise=True)
+                
+                # Environment step
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                # Store experience
+                agent.replay_buffer.add(state, action, reward, next_state, done)
+                
+                state = next_state
+                episode_reward += reward
+                steps += 1
+                
+                # Training (now that we have good data)
+                if len(agent.replay_buffer) > 1000:
+                    critic_loss, actor_loss = agent.train()
+                    episode_losses['critic'].append(critic_loss)
+                    episode_losses['actor'].append(actor_loss)
+                    
+                    if steps % 5 == 0:  # Train env model less frequently
+                        env_model_loss = agent.train_env_model()
+                        episode_losses['env_model'].append(env_model_loss)
+            
+            if stopper.stop_training:
+                break
+                
+            episode_rewards.append(episode_reward)
+            
+            # Calculate average losses for this episode
+            avg_losses = {k: np.mean(v) if v else 0.0 for k, v in episode_losses.items()}
+            
+            # PER-EPISODE LOGGING based on log_frequency
+            if episode % log_frequency == 0:
+                avg_reward = np.mean(episode_rewards[-min(100, len(episode_rewards)):])
+                
+                if log_frequency == 1:
+                    # Compact format for every episode
+                    print(f"Ep {episode:4d} | R: {episode_reward:7.2f} | Avg: {avg_reward:7.2f} | "
+                          f"Buf: {len(agent.replay_buffer):5d} | Noise: {agent.current_noise_scale:.3f} | "
+                          f"Steps: {steps:3d}")
+                else:
+                    # Detailed format for less frequent logging
+                    std_reward = np.std(episode_rewards[-min(100, len(episode_rewards)):])
+                    elapsed_time = time.time() - start_time
+                    print(f"Episode {episode}")
+                    print(f"Average Reward (last {min(100, len(episode_rewards))}): {avg_reward:.2f} ± {std_reward:.2f}")
+                    print(f"Latest Reward: {episode_reward:.2f}")
+                    print(f"Buffer Size: {len(agent.replay_buffer)}")
+                    print(f"Current Noise Scale: {agent.current_noise_scale:.3f}")
+                    print(f"Time Elapsed: {elapsed_time/60:.1f} minutes")
+                    print(f"Losses - Critic: {avg_losses['critic']:.4f}, Actor: {avg_losses['actor']:.4f}, Env Model: {avg_losses['env_model']:.4f}")
+                    print("-" * 60)
+            
+            # Detailed logging every 50 episodes regardless of log_frequency
+            if episode % 50 == 0 and log_frequency == 1:
+                avg_reward = np.mean(episode_rewards[-min(100, len(episode_rewards)):])
+                std_reward = np.std(episode_rewards[-min(100, len(episode_rewards)):])
+                elapsed_time = time.time() - start_time
+                
+                print(f"\n=== Episode {episode} Detailed Report ===")
+                print(f"Average Reward (last {min(100, len(episode_rewards))}): {avg_reward:.2f} ± {std_reward:.2f}")
+                print(f"Latest Reward: {episode_reward:.2f}")
+                print(f"Buffer Size: {len(agent.replay_buffer)}")
+                print(f"Current Noise Scale: {agent.current_noise_scale:.3f}")
+                print(f"Time Elapsed: {elapsed_time/60:.1f} minutes")
+                print(f"Total Episodes Completed: {episode + 1}")
+                print(f"Losses - Critic: {avg_losses['critic']:.4f}, Actor: {avg_losses['actor']:.4f}, Env Model: {avg_losses['env_model']:.4f}")
+                
+                # Show best performance achieved so far
+                if len(episode_rewards) >= 100:
+                    best_100_avg = max([np.mean(episode_rewards[i:i+100]) for i in range(len(episode_rewards)-99)])
+                    print(f"Best 100-episode average so far: {best_100_avg:.2f}")
+                
+                print("-" * 70)
+            
+            # Dream training phase
+            if (episode - exploration_episodes) % dream_frequency == 0 and episode > exploration_episodes + 10:
+                print(f"💭 Episode {episode}: Entering dream phase...")
+                
+                # Generate dreams
+                dreams = agent.generate_dreams()
+                
+                if dreams:
+                    # Train on dreams multiple times
+                    dream_losses = []
+                    for _ in range(15):  # More dream training iterations
+                        dream_loss = agent.train_on_dreams(dreams)
+                        if dream_loss > 0:
+                            dream_losses.append(dream_loss)
+                    
+                    avg_dream_loss = np.mean(dream_losses) if dream_losses else 0
+                    print(f"✨ Dream phase completed. Generated {len(dreams)} rollouts. "
+                          f"Avg dream loss: {avg_dream_loss:.4f}")
+            
+            # Save checkpoints and models every 50 episodes
+            if episode % 50 == 0:
+                avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+                
+                # Save best model
+                if avg_reward > best_avg_reward:
+                    best_avg_reward = avg_reward
+                    best_model_path = run_dir / "best_model.pth"
+                    agent.save(str(best_model_path))
+                    best_episode = episode
+                    print(f"🎉 New best model saved! Average reward: {best_avg_reward:.2f}")
+                
+                # Save training state
+                save_training_state(run_dir, agent, episode_rewards, episode, best_avg_reward, best_episode)
+            
+            # Performance milestone notifications (but don't stop!)
+            if len(episode_rewards) >= 100:
+                recent_avg = np.mean(episode_rewards[-100:])
+                # Environment-specific performance milestones for notifications
+                milestones = {
+                    'LunarLanderContinuous-v3': [0, 50, 100, 150, 200, 250],
+                    'BipedalWalker-v3': [100, 200, 300, 350],
+                    'HalfCheetah-v3': [1000, 2000, 3000, 4000, 5000],
+                    'Ant-v3': [1000, 2000, 3000, 4000, 5000],
+                    'Humanoid-v3': [2000, 4000, 6000, 8000]
+                }
+                
+                env_milestones = milestones.get(env_name, [0, 100, 200, 300])
+                
+                # Check if we've reached a new milestone
+                for milestone in env_milestones:
+                    if (recent_avg >= milestone and 
+                        (episode == 0 or np.mean(episode_rewards[-200:-100]) < milestone)):
+                        print(f"🎯 MILESTONE REACHED! Average reward: {recent_avg:.2f} >= {milestone}")
+                        break
+            
+            episode += 1
+    
+    env.close()
+    
+    # Final save when training is stopped
+    print("💾 Saving final training state...")
+    final_model_path = run_dir / "final_model.pth"
+    agent.save(str(final_model_path))
+    save_training_state(run_dir, agent, episode_rewards, episode-1, best_avg_reward, best_episode)
+    
+    print(f"✅ Training completed after {len(episode_rewards)} episodes.")
+    print(f"📁 All files saved to: {run_dir}")
+    
+    # Create run summary
+    summary = {
+        'environment': env_name,
+        'total_episodes': len(episode_rewards),
+        'final_average_reward': np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards),
+        'best_average_reward': best_avg_reward,
+        'best_episode': best_episode,
+        'training_completed': datetime.now().isoformat(),
+        'run_directory': str(run_dir)
+    }
+    
+    summary_path = run_dir / "run_summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    return episode_rewards
+
+def evaluate_agent_from_run(run_dir, num_episodes=10, render=False):
+    """Evaluate agent from a specific run directory"""
+    
+    # Load metadata to get environment name
+    metadata_path = run_dir / "training_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"No training metadata found in {run_dir}")
+    
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+    
+    env_name = metadata['env_name']
+    
+    # Setup environment
+    if render:
+        env = gym.make(env_name, render_mode='human')
+    else:
+        env = gym.make(env_name)
+        
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    max_action = float(env.action_space.high[0])
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    agent = Agent(state_dim, action_dim, max_action, env_name, device)
+    
+    # Load best model
+    best_model_path = run_dir / "best_model.pth"
+    if best_model_path.exists():
+        agent.load(str(best_model_path))
+        print(f"✅ Loaded best model from {best_model_path}")
+    else:
+        # Fallback to latest model
+        latest_model_path = run_dir / "latest.pth"
+        agent.load(str(latest_model_path))
+        print(f"✅ Loaded latest model from {latest_model_path}")
+    
+    episode_rewards = []
+    episode_lengths = []
+    
+    print(f"🧪 Evaluating agent on {env_name} for {num_episodes} episodes...")
+    
+    for episode in range(num_episodes):
+        state, _ = env.reset()
+        episode_reward = 0
+        episode_length = 0
+        done = False
+        
+        while not done:
+            action = agent.select_action(state, add_noise=False)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            state = next_state
+            episode_reward += reward
+            episode_length += 1
+            
+            if render:
+                time.sleep(0.01)  # Small delay for human viewing
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+        print(f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Length = {episode_length}")
+    
+    avg_reward = np.mean(episode_rewards)
+    std_reward = np.std(episode_rewards)
+    avg_length = np.mean(episode_lengths)
+    
+    print(f"\n📊 Evaluation Results:")
+    print(f"Average Reward: {avg_reward:.2f} ± {std_reward:.2f}")
+    print(f"Min Reward: {min(episode_rewards):.2f}")
+    print(f"Max Reward: {max(episode_rewards):.2f}")
+    print(f"Average Episode Length: {avg_length:.1f}")
+    
+    env.close()
+    return episode_rewards
+
+def list_runs(models_dir, env_name):
+    """List all available runs for an environment"""
+    env_dir = Path(models_dir) / env_name
+    
+    if not env_dir.exists():
+        print(f"No runs found for environment {env_name}")
+        return []
+    
+    runs = []
+    for run_dir in env_dir.iterdir():
+        if run_dir.is_dir() and run_dir.name.startswith('run_'):
+            metadata_path = run_dir / "training_metadata.json"
+            if metadata_path.exists():
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+                runs.append({
+                    'name': run_dir.name,
+                    'path': str(run_dir),
+                    'episodes': metadata.get('total_episodes', 'Unknown'),
+                    'best_reward': metadata.get('best_avg_reward', 'Unknown'),
+                    'last_update': metadata.get('last_update', 'Unknown')
+                })
+    
+    # Sort by last update
+    runs.sort(key=lambda x: x['last_update'], reverse=True)
+    
+    print(f"\n📋 Available runs for {env_name}:")
+    print("-" * 100)
+    print(f"{'Run Name':<20} {'Episodes':<10} {'Best Reward':<15} {'Last Update':<20} {'Path'}")
+    print("-" * 100)
+    
+    for run in runs:
+        episodes = str(run['episodes']) if run['episodes'] != 'Unknown' else 'Unknown'
+        best_reward = f"{run['best_reward']:.2f}" if run['best_reward'] != 'Unknown' else 'Unknown'
+        last_update = run['last_update'][:19] if run['last_update'] != 'Unknown' else 'Unknown'
+        print(f"{run['name']:<20} {episodes:<10} {best_reward:<15} {last_update:<20} {run['path']}")
+    
+    return runs
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description='Train Agent with Simplified Directory Structure: models/{env}/',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Start new training
+  python train.py --env LunarLanderContinuous-v3
+  
+  # Resume from latest run
+  python train.py --env LunarLanderContinuous-v3 --resume latest
+  
+  # Resume from specific run
+  python train.py --env LunarLanderContinuous-v3 --resume run_20240802_143022
+  
+  # List available runs
+  python train.py --env LunarLanderContinuous-v3 --list-runs
+  
+  # Evaluate latest run
+  python train.py --env LunarLanderContinuous-v3 --evaluate latest
+  
+  # Train with episode limit
+  python train.py --env BipedalWalker-v3 --episodes 5000
+        """
+    )
+    
+    parser.add_argument("--env", default="LunarLanderContinuous-v3", 
+                       help="Environment name")
+    parser.add_argument("--episodes", type=int, default=None,
+                       help="Number of training episodes (None = infinite)")
+    parser.add_argument("--models-dir", default="./models",
+                       help="Base models directory")
+    parser.add_argument("--log-freq", type=int, default=1,
+                       help="Logging frequency (1=every episode, 10=every 10 episodes)")
+    parser.add_argument("--no-exploration", action="store_true",
+                       help="Skip exploration phase")
+    parser.add_argument("--resume", type=str, default=None,
+                       help="Resume from run (use 'latest' for most recent)")
+    parser.add_argument("--evaluate", type=str, default=None,
+                       help="Evaluate specific run (use 'latest' for most recent)")
+    parser.add_argument("--eval-episodes", type=int, default=10,
+                       help="Number of evaluation episodes")
+    parser.add_argument("--render", action="store_true",
+                       help="Render during evaluation")
+    parser.add_argument("--list-runs", action="store_true",
+                       help="List all available runs for the environment")
+    
+    args = parser.parse_args()
+    
+    if args.list_runs:
+        list_runs(args.models_dir, args.env)
+    elif args.evaluate:
+        # Find run directory for evaluation
+        env_dir = Path(args.models_dir) / args.env
+        if args.evaluate == "latest":
+            run_dirs = [d for d in env_dir.iterdir() if d.is_dir() and d.name.startswith('run_')]
+            if not run_dirs:
+                print(f"❌ No runs found for {args.env}")
+                exit(1)
+            run_dirs.sort(key=lambda x: x.stat().st_mtime)
+            run_dir = run_dirs[-1]
+        else:
+            run_dir = env_dir / args.evaluate
+            if not run_dir.exists():
+                print(f"❌ Run {args.evaluate} not found")
+                exit(1)
+        
+        evaluate_agent_from_run(run_dir, args.eval_episodes, args.render)
+    else:
+        print(f"🚀 Starting training on {args.env}")
+        if args.episodes:
+            print(f"📊 Training for {args.episodes} episodes")
+        else:
+            print("🔄 Training indefinitely until stopped")
+        
+        enable_exploration = not args.no_exploration
+        
+        try:
+            rewards = train(
+                env_name=args.env, 
+                max_episodes=args.episodes,
+                models_dir=args.models_dir,
+                enable_exploration=enable_exploration,
+                resume_run=args.resume,
+                log_frequency=args.log_freq
+            )
+            
+            print("✅ Training completed successfully!")
+        
+        except KeyboardInterrupt:
+            print("\n🛑 Training interrupted by user.")
+            print("💾 Training state has been saved and can be resumed.")
